@@ -4,11 +4,13 @@
 
 # Jornada 720 Linux
 
-There is everything you need to run Linux on Jornada 720 in this repository! Tutorials cover how to setup partition CF Flash, how to copy root file system, how chroot works and how to compile the kernel yourself, of course there are already prebuilt kernel images.
+There is everything you need to run Linux on **Jornada 720** in this repository! Tutorials cover how to setup [partition](../../wiki/partitioning) CF Flash, how to [copy root file system](../../wiki/system-install), how [chroot](../../wiki/chrooting) works and how to [compile the kernel yourself](../../wiki/chrooting#compiling-kernel), of course there are already prebuilt kernel images.
 
-Read [wiki](wiki) how to install Debian 9 or Devuan 2.1 Linux distribution to CF Card.
+Read [wiki](../../wiki) how to install Debian 9 or Devuan 2.1 Linux distribution to CF Card.
 
 # jornada-config (Devuan)
 
-Read [wiki page](chrooting#installing-jornada-config-for-devuan) how to install **jornada-config**
+Jornada 7xx Devuan-Linux configuration scripts and localized keyboard / button handler services written by [timob0](../../../../timob0).
+
+Read [wiki page](../../wiki/chrooting#installing-jornada-config-for-devuan) how to install **jornada-config**
 
