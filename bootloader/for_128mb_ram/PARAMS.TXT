@@ -1,0 +1,3 @@
+\Storage Card\zimage
+\Storage Card\
+root=/dev/sda2 mem=128m rootdelay=5 bx_patch=1

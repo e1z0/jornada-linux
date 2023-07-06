@@ -1,0 +1,11 @@
+keycode  10 = 1 exclam asciitilde 1 exclam asciitilde
+keycode  11 = 2 at grave 2 at grave
+keycode  12 = 3 numbersign sterling 3 numbersign sterling
+keycode  13 = 4 dollar EuroSign 4 dollar EuroSign
+keycode  33 = p P braceleft p P braceleft
+keycode  47 = semicolon colon bracketleft semicolon colon bracketleft
+keycode  48 = apostrophe quotedbl bracketright apostrophe quotedbl bracketright
+keycode  49 = Mode_switch Alt_R Mode_switch
+keycode  51 = backslash bar braceright backslash bar braceright
+
+

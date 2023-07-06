@@ -1,0 +1,10 @@
+--- arch/arm/mm/Kconfig
++++ arch/arm/mm/Kconfig
+@@ -429,6 +429,7 @@ config CPU_32v4
+ 	select NEED_KUSER_HELPERS
+ 	select TLS_REG_EMUL if SMP || !MMU
+ 	select CPU_NO_EFFICIENT_FFS
++	select ARMv4_BX_EMUL if !SMP
+ 
+ config CPU_32v4T
+ 	bool

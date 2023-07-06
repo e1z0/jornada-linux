@@ -1,0 +1,1012 @@
+#!/bin/sh
+# HP Jornada Config, based on the raspi-config script
+# See LICENSE file for copyright and license details
+
+INTERACTIVE=True
+ASK_TO_REBOOT=0
+
+USER=${SUDO_USER:-$(who -m | awk '{ print $1 }')}
+MACHINE=`cat /proc/cpuinfo | grep Jornada | cut -c12-`
+TITLE="HP Jornada Configuration (jornada-config)"
+BTITLE=$MACHINE
+# echo $USER
+# echo $MACHINE
+
+is_jornada () {
+  if ! grep -q "HP Jornada" /proc/cpuinfo; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+CMDLINE=/proc/cmdline
+
+is_ssh() {
+  if pstree -p | egrep --quiet --extended-regexp ".*sshd.*\($$\)"; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+is_installed() {
+    if [ "$(dpkg -l "$1" 2> /dev/null | tail -n 1 | cut -d ' ' -f 1)" != "ii" ]; then
+      return 1
+    else
+      return 0
+    fi
+}
+
+deb_ver () {
+  ver=`cat /etc/debian_version | cut -d . -f 1`
+  echo $ver
+}
+
+calc_wt_size() {
+  WT_HEIGHT=13
+  WT_WIDTH=$(tput cols)
+
+  if [ -z "$WT_WIDTH" ] || [ "$WT_WIDTH" -lt 60 ]; then
+    WT_WIDTH=80
+  fi
+  if [ "$WT_WIDTH" -gt 178 ]; then
+    WT_WIDTH=120
+  fi
+  WT_MENU_HEIGHT=$(($WT_HEIGHT-7))
+}
+
+do_about() {
+  whiptail --msgbox "\
+This tool helps you with first time configuration
+of your HP Jornada 7xx under Devuan Linux.\n\n
+Contibuted to the community at hpcfactor.com
+" 14 70 1
+  return 0
+}
+
+do_expand_rootfs() {
+  if [ $(id -u) -ne 0 ]; then
+    whiptail --msgbox "This command must be run as superuser." 14 60 2
+    return 0
+  fi
+
+  ROOT_PART="$(findmnt / -o source -n)"
+  ROOT_DEV="/dev/$(lsblk -no pkname "$ROOT_PART")"
+  PART_NUM="$(echo "$ROOT_PART" | grep -o "[[:digit:]]*$")"
+
+  # Assume it's the DOS,root,swap layout, then partnum=2
+  if [ "$PART_NUM" -ne 2 ]; then
+    whiptail --msgbox "Your partition layout is not currently supported by this tool. Expected layout is DOS,root,swap." 14 60 2
+    return 0
+  fi
+
+  whiptail --msgbox "Current Disklayout:\n$(parted "$ROOT_DEV" -s unit MB p | tail -n+7)" 14 60 2
+
+  if (whiptail --title "Resize root partition" --yes-button "Continue" --no-button "Cancel"  --yesno "Now turning off swap and resizing partition $ROOT_PART - continue?" 14 60) then
+    echo ""
+  else
+    whiptail --msgbox "Cancelled, no changes done." 10 60 2
+    return 0
+  fi
+
+  whiptail --infobox "Disabling swap..." 14 60 1
+  swapoff -a  > /tmp/resize.log
+  whiptail --infobox "Dropping swap, changing root partition size..." 14 60 1
+  parted --script -- "$ROOT_DEV" \
+    rm 3 \
+    resizepart 2 -256M \
+    mkpart primary linux-swap -256 -0 \
+    set 1 boot \
+    quit \
+    >> /tmp/resize.log
+
+  whiptail --infobox "Root partition has been resized.\n\nNow enlarging filesystem and re-creating swap..." 14 60 2
+  mkswap /dev/hda3  >> /tmp/resize.log
+  swapon -a  >> /tmp/resize.log
+  resize2fs $ROOT_PART >> /tmp/resize.log
+
+  whiptail --msgbox "All done. Root partition using full disk capacity now.\n$(parted "$ROOT_DEV" -s unit MB p | tail -n+7)\n\nPlease review logfile /tmp/resize.log" 14 60 2
+  whiptail --textbox /tmp/resize.log 14 60 2
+}
+
+is_number() {
+  case $1 in
+    ''|*[!0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+do_change_pass() {
+  whiptail --msgbox "You will now be asked to enter a new password for the $USER user" 14 60 1
+  passwd $USER &&
+  whiptail --msgbox "Password changed successfully" 14 60 1
+}
+
+do_add_user() {
+  NEWUSER="$1"
+  while [ -z "$NEWUSER" ] && [ "$INTERACTIVE" = True ]; do
+    NEWUSER=$(whiptail --inputbox "Please enter new user name" 14 60 3>&1 1>&2 2>&3)
+    if [ $? -ne 0 ]; then
+      return 0
+    elif [ -z "$NEWUSER" ]; then
+      whiptail --msgbox "Please enter a non empty user name." 14 60
+    fi
+  done
+  # add the NEWUSER
+  useradd -G sudo,audio,video,input -m -s /bin/bash $NEWUSER
+  whiptail --msgbox "You will now be asked to enter a new password for the $NEWUSER user" 14 60 1
+  passwd $NEWUSER &&
+
+  # create an alias to this tool
+  echo "alias jconf='sudo /opt/jornada-config/jornada-config'" > /home/$NEWUSER/.bash_aliases
+
+  # setup non-password sudo
+  echo "$NEWUSER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$NEWUSER
+
+  whiptail --msgbox "User created successfully." 14 60 1
+}
+
+do_rcconf() {
+  RCCONF=`which rcconf`
+  if [ -z "$RCCONF" ]; then
+    whiptail --msgbox "Please install rcconf for this menu to work (apt-get install rcconf)." 14 60
+    return 0
+  fi
+  rcconf --whiptail
+}
+
+do_change_locale() {
+  if [ "$INTERACTIVE" = True ]; then
+    dpkg-reconfigure locales
+  else
+    local LOCALE="$1"
+    if ! LOCALE_LINE="$(grep "^$LOCALE " /usr/share/i18n/SUPPORTED)"; then
+      return 1
+    fi
+    local ENCODING="$(echo $LOCALE_LINE | cut -f2 -d " ")"
+    echo "$LOCALE $ENCODING" > /etc/locale.gen
+    sed -i "s/^\s*LANG=\S*/LANG=$LOCALE/" /etc/default/locale
+    dpkg-reconfigure -f noninteractive locales
+  fi
+}
+
+do_change_timezone() {
+  if [ "$INTERACTIVE" = True ]; then
+    dpkg-reconfigure tzdata
+  else
+    local TIMEZONE="$1"
+    if [ ! -f "/usr/share/zoneinfo/$TIMEZONE" ]; then
+      return 1;
+    fi
+    rm /etc/localtime
+    echo "$TIMEZONE" > /etc/timezone
+    dpkg-reconfigure -f noninteractive tzdata
+  fi
+}
+
+get_hostname() {
+    cat /etc/hostname | tr -d " \t\n\r"
+}
+
+do_hostname() {
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "\
+Please note: RFCs mandate that a hostname's labels \
+may contain only the ASCII letters 'a' through 'z' (case-insensitive), 
+the digits '0' through '9', and the hyphen.
+Hostname labels cannot begin or end with a hyphen. 
+No other symbols, punctuation characters, or blank spaces are permitted.\
+" 20 70 1
+  fi
+  CURRENT_HOSTNAME=`cat /etc/hostname | tr -d " \t\n\r"`
+  if [ "$INTERACTIVE" = True ]; then
+    NEW_HOSTNAME=$(whiptail --inputbox "Please enter a hostname" 20 60 "$CURRENT_HOSTNAME" 3>&1 1>&2 2>&3)
+  else
+    NEW_HOSTNAME=$1
+    true
+  fi
+  if [ $? -eq 0 ]; then
+    echo $NEW_HOSTNAME > /etc/hostname
+    sed -i "s/127.0.1.1.*$CURRENT_HOSTNAME/127.0.1.1\t$NEW_HOSTNAME/g" /etc/hosts
+    ASK_TO_REBOOT=1
+  fi
+}
+
+do_overclock() {
+    whiptail --msgbox "Not implemented for Jornada." 20 60 2
+    return 1
+}
+
+set_overclock() {
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "Set overclock to preset '$1'" 20 60 2
+  fi
+}
+
+clear_overclock () {
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "Set overclock to preset 'None'" 20 60 2
+  fi
+}
+
+get_ssh() {
+  if service ssh status | grep -q inactive; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+do_ssh() {
+  if [ -e /var/log/regen_ssh_keys.log ] && ! grep -q "^finished" /var/log/regen_ssh_keys.log; then
+    whiptail --msgbox "Initial ssh key generation still running. Please wait and try again." 20 60 2
+    return 1
+  fi
+  DEFAULT=--defaultno
+  if [ $(get_ssh) -eq 0 ]; then
+    DEFAULT=
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --yesno \
+      "Would you like the SSH server to be enabled?\n\nCaution: Default and weak passwords are a security risk when SSH is enabled!" \
+      $DEFAULT 20 60 2
+    RET=$?
+  else
+    RET=$1
+  fi
+  if [ $RET -eq 0 ]; then
+    ssh-keygen -A &&
+    update-rc.d ssh enable &&
+    invoke-rc.d ssh start &&
+    STATUS=enabled
+  elif [ $RET -eq 1 ]; then
+    update-rc.d ssh disable &&
+    invoke-rc.d ssh stop &&
+    STATUS=disabled
+  else
+    return $RET
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "The SSH server is $STATUS" 14 60 1
+  fi
+}
+
+disable_jornada_config_at_boot() {
+  if [ -e /etc/profile.d/jornada-config.sh ]; then
+    whiptail --yesno \
+      "Disable this config script from next boot?" \
+      $DEFAULT 14 60 2
+      if [ $? -eq 0 ]; then
+        rm -f /etc/profile.d/jornada-config.sh
+        whiptail --msgbox "Disabled. Rerun this script with: /opt/jornada-config/jornada-config" 14 60 1
+      fi  
+  fi
+}
+
+enable_jornada_config_at_boot() {
+  echo "/opt/jornada-config/jornada-config" > /etc/profile.d/jornada-config.sh
+}
+
+do_boot_behaviour() {
+  if [ "$INTERACTIVE" = True ]; then
+    BOOTOPT=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Boot Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+      "L Login" "Require user to login" \
+      "A Autologin" "Automatic login as '$USER' user" \
+      "D Desktop" "After login: Start desktop" \
+      "C Console" "After login: Stay on console" \
+      "S Shell ..." "Setup shell for console session" \
+      "X X11 ..." "Setup X11 window manager" \
+      3>&1 1>&2 2>&3)
+  else
+    BOOTOPT=$1
+    true
+  fi
+  if [ $? -eq 0 ]; then
+    case "$BOOTOPT" in
+      L*)
+        cp -f /opt/jornada-config/scripts/inittab.noauto /etc/inittab
+        whiptail --msgbox "Autologin disabled from next boot." 14 60 2
+        ;;
+      A*)
+        cat /opt/jornada-config/scripts/inittab.auto | sed -e s/AUTOUSER/$USER/g > /etc/inittab
+        whiptail --msgbox "System set to automatic login for $USER." 14 60 2
+        ;;
+      D*)
+	rm ~/.bash_profile
+	echo "startx" > ~/.bash_profile
+        whiptail --msgbox "Desktop will autostart." 14 60 2
+        ;;
+      C*)
+	rm ~/.bash_profile
+        whiptail --msgbox "Desktop will not autostart." 14 60 2
+	;;
+      S*) do_shell_setup ;;
+      X*) do_x11_wm_setup ;;
+      *)
+        whiptail --msgbox "Programmer error, unrecognised boot option" 20 60 2
+        return 1
+        ;;
+    esac
+  fi
+}
+
+do_update() {
+  whiptail --infobox "Please standby while updating..." 10 60 1
+  (cd /opt/jornada-config && git pull)
+  # git clone https://github.com/timob0/jornada-config.git /opt/jornada-config
+  whiptail --infobox "Sleeping 5 seconds before reloading...\n" 10 60 1
+  sleep 5 &&
+  exec /opt/jornada-config/jornada-config
+}
+
+get_wifi_available() {
+  TECH=`connmanctl technologies`
+  if (echo "$TECH" | grep -q WiFi) then
+    return 1
+  else
+    return 0
+  fi
+}
+
+get_wifi_active() {
+  TECH=`connmanctl technologies`
+  if (echo "$TECH" | grep -q "Powered = True") then
+    return 1
+  else
+    return 0
+  fi
+}
+
+get_wifi_connected() {
+  TECH=`connmanctl technologies`
+  if (echo "$TECH" | grep -q "Connected = True") then
+    return 1
+  else
+    return 0
+  fi
+}
+
+do_enable_wifi() {
+  pccardctl insert 0
+  sleep 3
+  connmanctl enable wifi
+}
+
+do_disable_wifi() {
+  connmanctl disable wifi
+  sleep 3
+  pccardctl eject 0
+}
+
+do_scan_networks() {
+  connmanctl scan wifi
+}
+
+do_list_wlan_networks() {
+  connmanctl services
+}
+
+do_connect_wifi() {
+  connmanctl connect $1
+}
+
+do_switch_wifi_power() {
+  if (whiptail --title "Wifi Status" --yes-button "Wifi On" --no-button "Wifi Off"  --yesno "Please select On or Off to switich Wifi state" 10 60) then
+    whiptail --infobox "Enabling Wifi..." 10 60 1
+    do_enable_wifi
+  else
+    whiptail --infobox "Disabling Wifi..." 10 60 1
+    do_disable_wifi
+  fi
+}
+
+do_switch_wifi_net() {
+  get_wifi_available
+  if [ $? -eq 0 ]; then
+    whiptail --msgbox "Wifi not available, please check network card" 14 60
+    return 1
+  fi
+
+  get_wifi_active
+  if [ $? -eq 0 ]; then
+    whiptail --infobox "Wifi not active, trying to power on ..." 14 60
+    do_enable_wifi
+    get_wifi_active
+    if [ $? -eq 0 ]; then
+      whiptail --msgbox "Could not activate WiFi, aborting." 14 60
+      return 1
+    fi
+  fi
+
+  connmanctl services > /tmp/services
+  CONNECTED=`cat /tmp/services | grep '*' | cut -c26-`
+  AVAILABLE=`cat /tmp/services | cut -c26-`
+
+  echo a $AVAILABLE
+  echo c $CONNECTED
+
+  NETWORKS=`ls /var/lib/connman/ | grep wifi | sort -t _ -k 3`
+  NLIST=""
+  state="OFF"
+  for n in $NETWORKS
+  do
+    if [ -f /var/lib/connman/$n/settings ]; then
+      name=`cat /var/lib/connman/$n/settings | grep Name | cut -f2 -d=`
+      
+      # find which one we're connected to
+      if [ "$n"="$CONNECTED" ]; then
+        state="ON"
+      fi
+
+      if (echo "$AVAILABLE" | grep -q "$n") then
+        NLIST="$NLIST $n $name $state"
+      fi
+    fi
+  done
+
+  if [ -z "$NLIST" ]; then
+    whiptail --msgbox "No networks configured yet." 14 60 1 
+    retun 1
+  fi
+
+  NETWORK_ID=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --radiolist "Select WiFi network to connect" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+	    $NLIST \
+      3>&1 1>&2 2>&3)
+  if [ $? -eq 0 ]; then
+    echo $NETWORK_ID
+    echo $NETWORK_NAME_
+    whiptail --infobox "Connecting to network $NETWORK_NAME ($NETWORK_ID)" 14 60 1
+    connmanctl connect $NETWORK_ID
+  else
+    whiptail --msgbox "Cancelled." 14 60 1
+    return 0
+  fi
+
+  sleep 5
+
+  return 0
+}
+
+do_wifi_setup() {
+  get_wifi_available
+  if [ $? -eq 0 ]; then
+    whiptail --msgbox "Wifi not available, please check network card" 14 60
+    return 1
+  fi
+
+  get_wifi_active
+  if [ $? -eq 0 ]; then
+    whiptail --infobox "Wifi not active, trying to power on ..." 14 60
+    do_enable_wifi
+    get_wifi_active
+    if [ $? -eq 0 ]; then
+      whiptail --msgbox "Could not activate WiFi, aborting." 14 60
+      return 1
+    fi
+  fi
+
+  whiptail --infobox "Scanning wifi networks ..." 14 60
+  do_scan_networks
+  connmanctl services > /tmp/services
+  NETWORKS=`cat /tmp/services | cut -c5- | awk '{print $1 " " $2 " OFF"}'`
+  echo $NETWORKS
+  NETWORK_NAME=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --radiolist "Select WiFi network to configure" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+	    $NETWORKS \
+      3>&1 1>&2 2>&3)
+  if [ $? -eq 0 ] && [ -n "$NETWORK_NAME" ]; then
+    whiptail --msgbox "Using network $NETWORK_NAME" 14 60 1
+  else
+    whiptail --msgbox "Cancelled or nothing selected." 14 60 1
+    return 0
+  fi
+
+  NETWORK_DATA=$(cat /tmp/services | grep -w $NETWORK_NAME)
+  NETWORK_ID=$(echo $NETWORK_DATA | cut -f2 -d' ') 
+  NETWORK_SSID=$(echo $NETWORK_ID | cut -f3 -d'_') 
+  
+  whiptail --msgbox "selected:\ndata:$NETWORK_DATA\nid:$NETWORK_ID\nssid:$NETWORK_SSID\nname:$NETWORK_NAME" 14 60 1
+  
+  if [ -f /var/lib/connman/$NETWORK_ID/settings ]; then
+    whiptail --yesno  "Network $NETWORK_NAME already configured, do you want to reconfigure?" 14 60 1
+    if [ $? -eq 0 ]; then
+      whiptail --infobox "Deleting previous configuration ..." 14 60 1
+      rm -rf /var/lib/connman/$NETWORK_ID
+    else
+      whiptail --infobox "Cancelled." 14 60 1
+      return 0
+    fi
+  fi
+
+  PASSPHRASE=$(whiptail --inputbox "Please enter passphrase for $NETWORK_NAME. Leave it empty if none." 14 60 3>&1 1>&2 2>&3)
+  if [ $? -ne 0 ]; then
+    whiptail --msgbox "Cancelled, no changes made" 14 60 1
+    return 0
+  fi
+
+  # Write connmanctl config file
+  mkdir /var/lib/connman/$NETWORK_ID
+  cfgfile="/var/lib/connman/$NETWORK_ID/settings"
+  tstamp=`date --utc +%FT%T.%6NZ`
+  touch $cfgfile
+  echo "[$NETWORK_ID]" >> $cfgfile
+  echo "Name=$NETWORK_NAME" >> $cfgfile
+  echo "SSID=$NETWORK_SSID" >> $cfgfile
+  echo "Favorite=true" >> $cfgfile
+  echo "AutoConnect=true" >> $cfgfile
+  echo "Modified=$tstamp" >> $cfgfile
+  echo "Passphrase=$PASSPHRASE" >> $cfgfile
+  echo "IPv4.method=dhcp" >> $cfgfile
+  echo "IPv6.method=off" >> $cfgfile
+  echo "IPv6.privacy=disabled" >> $cfgfile
+  /etc/init.d/connman restart
+  whiptail --yesno "Configuration file written to $cfgfile\n\nTry to connect?" 14 60 1
+  if [ $? -eq 0 ]; then
+    whiptail --infobox "Connecting to $NETWORK_NAME ..." 14 60 1
+    connmanctl connect $NETWORK_ID
+  fi
+  return 0
+}
+
+do_finish() {
+  disable_jornada_config_at_boot
+  if [ $ASK_TO_REBOOT -eq 1 ]; then
+    whiptail --yesno "Would you like to reboot now?" 14 60 2
+    if [ $? -eq 0 ]; then # yes
+      sync
+      reboot
+    fi
+  fi
+  exit 0
+}
+
+do_nothing() {
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "This is not yet implemented" 14 60
+  fi
+}
+
+set_cpufreq() {
+        if [ "$1" -eq 59 ]; then
+                echo "Setting CPU frequency to 59.0 MHz"
+                busybox devmem 0x90020014 w 0x00000000
+        elif [ "$1" -eq 73 ]; then
+                echo "Setting CPU frequency to 73.7 MHz"
+                busybox devmem 0x90020014 w 0x00000001
+        elif [ "$1" -eq 88 ]; then
+                echo "Setting CPU frequency to 88.5 MHz"
+                busybox devmem 0x90020014 w 0x00000002
+        elif [ "$1" -eq 103 ]; then
+                echo "Setting CPU frequency to 103.2 MHz"
+                busybox devmem 0x90020014 w 0x00000003
+        elif [ "$1" -eq 118 ]; then
+                echo "Setting CPU frequency to 118.0 MHz"
+                busybox devmem 0x90020014 w 0x00000004
+        elif [ "$1" -eq 132 ]; then
+                echo "Setting CPU frequency to 132.7 MHz"
+                busybox devmem 0x90020014 w 0x00000005
+        elif [ "$1" -eq 147 ]; then
+                echo "Setting CPU frequency to 147.5 MHz"
+                busybox devmem 0x90020014 w 0x00000006
+        elif [ "$1" -eq 162 ]; then
+                echo "Setting CPU frequency to 162.2 MHz"
+                busybox devmem 0x90020014 w 0x00000007
+        elif [ "$1" -eq 176 ]; then
+                echo "Setting CPU frequency to 176.9 MHz"
+                busybox devmem 0x90020014 w 0x00000008
+        elif [ "$1" -eq 191 ]; then
+                echo "Setting CPU frequency to 191.7 MHz"
+                busybox devmem 0x90020014 w 0x00000009
+        elif [ "$1" -eq 206 ]; then
+                echo "Setting CPU frequency to 206.4 MHz"
+                busybox devmem 0x90020014 w 0x0000000A
+        elif [ "$1" -eq 221 ]; then
+                echo "Setting CPU frequency to 221.2 MHz"
+                busybox devmem 0x90020014 w 0x0000000B
+        else
+                echo "Set the CPU frequency (example "./cpufreq.sh 206") - allowed values: 59, 73, 88, 103, 118, 132, 147, 162, 176, 191, 206, 221"
+        fi
+}
+
+# Set minimum CPU clock
+do_cpufreq_min() {
+  set_cpufreq 59
+}
+
+# Set normal CPU clock
+do_cpufreq_norm() {
+  set_cpufreq 206
+}
+
+# Set maximum CPU clock
+do_cpufreq_max() {
+    set_cpufreq 221
+}
+
+# Set Kernel to patch the BX emulation 
+do_bx_patch() {
+    echo P > /proc/cpu/bx_emulation 
+}
+
+# Set Kernel to emulate the BX emulation
+do_bx_emulator() {
+    echo E > /proc/cpu/bx_emulation 
+}
+
+get_brightness() {
+  RET=`cat /sys/class/backlight/s1d13xxxfb/brightness`
+  return $RET
+}
+
+get_contrast() {
+  RET=`cat /sys/devices/platform/jornada_lcd/lcd/s1d13xxxfb/contrast`
+  return $RET
+}
+
+set_brightness() {
+  echo $1 > /sys/class/backlight/s1d13xxxfb/brightness
+}
+
+set_contrast() {
+  echo $1 > /sys/devices/platform/jornada_lcd/lcd/s1d13xxxfb/contrast
+}
+
+inc_contrast() {
+  CONTRAST=`cat /sys/devices/platform/jornada_lcd/lcd/s1d13xxxfb/contrast`  
+  CONTRAST=$(($CONTRAST+16))
+  set_contrast $CONTRAST
+}
+
+dec_contrast() {
+  CONTRAST=`cat /sys/devices/platform/jornada_lcd/lcd/s1d13xxxfb/contrast`  
+  CONTRAST=$(($CONTRAST-16))
+  set_contrast $CONTRAST
+}
+
+inc_brightness() {
+  BRIGHT=`cat /sys/class/backlight/s1d13xxxfb/brightness`
+  BRIGHT=$(($BRIGHT+16))
+  set_brightness $BRIGHT
+}
+
+dec_brightness() {
+  BRIGHT=`cat /sys/class/backlight/s1d13xxxfb/brightness`
+  BRIGHT=$(($BRIGHT-16))
+  set_brightness $BRIGHT
+}
+
+do_enable_backlight() {
+  echo 0 > /sys/class/backlight/s1d13xxxfb/bl_power
+}
+
+do_disable_backlight() {
+  echo 1 > /sys/class/backlight/s1d13xxxfb/bl_power
+}
+
+do_lcd_setup() {
+  while true; do
+    BRIGHT=`cat /sys/class/backlight/s1d13xxxfb/brightness`
+    CONTRAST=`cat /sys/devices/platform/jornada_lcd/lcd/s1d13xxxfb/contrast`
+    
+    FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "LCD Setup" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+      "B  (*) >>" "Brightness increase ($BRIGHT)" \
+      "V  (*) <<" "           decrease" \
+      "C  (#) >>" "Contrast increase ($CONTRAST)" \
+      "X  (#) <<" "         decrease" \
+      3>&1 1>&2 2>&3)
+    RET=$?
+    if [ $RET -eq 1 ]; then
+      return 0
+    elif [ $RET -eq 0 ]; then
+      case "$FUN" in
+        B\ *) inc_brightness ;;
+        V\ *) dec_brightness ;;
+        C\ *) inc_contrast ;;
+        X\ *) dec_contrast ;;
+        S\ *) do_nothing ;;
+        *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+      esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+    fi
+  done
+}
+
+do_poweroff() {
+  if (whiptail --title "Powerdown" --yes-button "Yes" --no-button "No"  --yesno "Poweroff the system?" 10 60) then
+    whiptail --infobox "Powering down..." 10 60 1
+    poweroff
+  else
+    return 0
+  fi
+}
+
+do_change_keyboard() {
+  # check if all scripts are in place
+  if [ ! -f /etc/init.d/j720-keyboard.sh ]; then
+    cp -f /opt/jornada-config/scripts/init/j720-keyboard.sh /etc/init.d
+    update-rc.d j720-keyboard.sh defaults
+    update-rc.d console-setup disable
+    whiptail --msgbox "Copied j720-keyboard script to /etc/init.d" 10 60 1
+  fi 
+
+  if [ ! -f $HOME/.Xsession ]; then
+    echo '[ -f "$HOME/.Xmodmap" ] && /usr/bin/xmodmap "$HOME/.Xmodmap"' > $HOME/.Xsession
+    whiptail --msgbox "xmodmap command added to $HOME/.Xsession file" 10 60 1
+  fi 
+
+  if (whiptail --title "Keyboard layout" --yes-button "US" --no-button "German"  --yesno "Please select which keymap to install at boot time. The change will become effective immediately." 10 60) then
+    whiptail --infobox "Install and load US keymap..." 10 60 1
+    cp -f /opt/jornada-config/keymaps/us-j720-key.map /etc/j720-key.map
+    cp -f /opt/jornada-config/keymaps/.us-Xmodmap $HOME/.Xmodmap
+  else
+    whiptail --infobox "Install and load keymap..." 10 60 1
+    cp -f /opt/jornada-config/keymaps/de-j720-key.map /etc/j720-key.map
+    cp -f /opt/jornada-config/keymaps/.de-Xmodmap $HOME/.Xmodmap
+  fi
+  /etc/init.d/j720-keyboard.sh start
+}
+
+do_shell_setup() {
+  SHELLS=`cat /etc/shells | grep '/bin' | sort -u | awk -v shell=$SHELL '{ print ($1!=shell)?$1 " shell " "OFF ":$1 " shell " "ON " }'`
+  echo $SHELLS
+  SHELLOPT=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --radiolist "Shell setup" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+	$SHELLS \
+      3>&1 1>&2 2>&3)
+  if [ $? -eq 0 ]; then
+    chsh $USER -s $SHELLOPT
+    whiptail --msgbox "Your shell has been changed to $SHELLOPT from next login." 14 60 1    
+  fi
+}
+
+do_x11_wm_setup() {
+  whiptail --infobox "Please select your desired X11 window manager" 10 60 1
+  update-alternatives --config x-window-manager
+
+  # Deactivate icewm session if other window manager configured
+  if ! (update-alternatives --get-selections | grep x-window-manager | grep -q icewm) ; then
+    whiptail --infobox "Removing icewm session manager" 10 60 1
+    # update-alternatives --remove x-session-manager /usr/bin/icewm-session
+    rm /etc/alternatives/x-session-manager
+  else
+    whiptail --infobox "Adding icewm session manager" 10 60 1
+    # update-alternatives --install x-session-manager /usr/bin/icewm-session
+    ln -s /usr/bin/icewm-session /etc/alternatives/x-session-manager
+  fi
+}
+
+nonint() {
+  "$@"
+}
+
+#
+# Command line options for non-interactive use
+#
+for i in $*
+do
+  case $i in
+  --expand-rootfs)
+    do_expand_rootfs
+    printf "Please reboot\n"
+    exit 0
+    ;;
+  --asroot)
+    USER=root
+    ;;
+  --install)
+    enable_jornada_config_at_boot
+    printf "Config utility installed at next boot"
+    exit 0;
+    ;;
+  --update)
+    do_update
+    exit 0;
+    ;;
+  --inc_brightness)
+    inc_brightness
+    exit 0;
+    ;;
+  --dec_brightness)
+    dec_brightness
+    exit 0;
+    ;;
+  --unsleep)
+    do_cpufreq_norm
+    do_enable_wifi
+    do_enable_backlight
+    exit 0;
+    ;;    
+  --sleep)
+    do_cpufreq_min
+    do_disable_wifi
+    do_disable_backlight
+    exit 0;
+    ;;    
+  nonint)
+    INTERACTIVE=False
+    "$@"
+    exit $?
+    ;;
+  *)
+    # unknown option
+    ;;
+  esac
+done
+
+# Everything else needs to be run as root
+if [ $(id -u) -ne 0 ]; then
+  printf "Script requires elevated rights. Try 'sudo jornada-config'\n"
+  exit 1
+fi
+
+do_system_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "System Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "S1 WiFi ..." "Configure WiFi network" \
+    "S2 Password" "Change password for the '$USER' user" \
+    "S3 Hostname" "Set name for this computer on a network" \
+    "S4 Add User ..." "Add a regular user account" \
+    "S5 Services ..." "Configure system services" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    case "$FUN" in
+      S1\ *) do_wifi_setup ;;
+      S2\ *) do_change_pass ;;
+      S3\ *) do_hostname ;;
+      S4\ *) do_add_user ;;
+      S5\ *) do_rcconf ;;
+      *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+    esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+  fi
+}
+
+do_interface_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Interfacing Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "S SSH" "Enable/disable remote command line access using SSH" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    case "$FUN" in
+      S\ *) do_ssh ;;
+      *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+    esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+  fi
+}
+
+do_cpuclock_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Select CPU Clock" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "59" "59 MHz" \
+    "73" "73 MHz" \
+    "88" "88 MHz" \
+    "103" "103 MHz" \
+    "118" "118 MHz" \
+    "132" "132 MHz" \
+    "147" "147 MHz" \
+    "162" "162 MHz" \
+    "176" "176 MHz" \
+    "191" "191 MHz" \
+    "206" "206 MHz" \
+    "221" "221 MHz - Overclock, might use more battery" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    set_cpufreq "$FUN"
+    sleep 2
+  fi
+}
+
+do_bxemu_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Select BX Handling" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "E " "Emulate BX in Kernel (slower)" \
+    "P " "Patch BX in Kernel (Faster)" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    case "$FUN" in
+      E\ *) do_bx_emulator ;;
+      P\ *) do_bx_patch ;;
+      *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+    esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+    echo "Selection: $FUN"
+    cat /proc/cpu/bx_emulation
+    sleep 2
+  fi
+}
+
+do_performance_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Performance Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "OC Overclock" "Configure CPU clock" \
+    "BX Emulation" "Configure Kernel BX emulator" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    case "$FUN" in
+      OC\ *) do_cpuclock_menu ;;
+      BX\ *) do_bxemu_menu ;;
+      *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+    esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+  fi
+}
+
+do_internationalisation_menu() {
+  FUN=$(whiptail --title "$TITLE" --backtitle="$BTITLE" --menu "Localisation Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+    "L Locale ..." "Configure language and regional settings" \
+    "T Timezone ..." "Configure time zone" \
+    "K Keyboard" "Set keyboard layout to match your keyboard" \
+    3>&1 1>&2 2>&3)
+  RET=$?
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    case "$FUN" in
+      L\ *) do_change_locale ;;
+      T\ *) do_change_timezone ;;
+      K\ *) do_change_keyboard ;;
+      *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+    esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+  fi
+}
+
+#
+# Interactive use loop
+#
+if [ "$INTERACTIVE" = True ]; then
+  [ -e $CONFIG ] || touch $CONFIG
+  calc_wt_size
+   while true; do
+    if [ "$USER" = "root" ]; then
+      FUN=$(whiptail --title "$TITLE, SYSTEM options ($USER)" --backtitle="$BTITLE" --menu "Setup Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Finish --ok-button Select \
+        "S1 Resize Disk" "Resize root partition to use full disk capacity" \
+        "S2 System ..." "Configure system settings" \
+        "S3 Localisation ..." "Configure language, regional and keyboard settings" \
+        "S4 Interfaces ..." "Configure external interfaces (SSH, ...)" \
+        "U1 Update" "Update this tool to the latest version" \
+        "A1 About" "Information about this tool" \
+        3>&1 1>&2 2>&3)
+    else
+      FUN=$(whiptail --title "$TITLE, USER options ($USER)" --backtitle="$BTITLE" --menu "Setup Options" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Finish --ok-button Select \
+        "W1 WiFi Power" "Turn Wifi on/off" \
+        "W2 WiFi Connect" "Switch WiFi network" \
+        "W3 WiFi ..." "Configure WiFi networks" \
+        "L1 LCD ..." "Set the screen brightness and contrast" \
+        "P2 Performance..." "Set CPU clock and BX handling"\
+        "B1 Startup ..." "System Startup Options" \
+        "B2 Shutdown" "Poweroff the machine" \
+        "P1 Password" "Change password for the '$USER' user" \
+        "A1 About" "Information about this tool" \
+        3>&1 1>&2 2>&3)
+    fi
+    RET=$?
+    if [ $RET -eq 1 ]; then
+      do_finish
+    elif [ $RET -eq 0 ]; then
+      case "$FUN" in
+        S1\ *) do_expand_rootfs ;;
+        S2\ *) do_system_menu ;;
+        S3\ *) do_internationalisation_menu ;;
+        S4\ *) do_interface_menu ;;
+        U1\ *) do_update ;;
+        A1\ *) do_about ;;
+        W1\ *) do_switch_wifi_power ;;
+        W2\ *) do_switch_wifi_net ;;
+        W3\ *) do_wifi_setup ;;
+        L1\ *) do_lcd_setup ;;
+        B1\ *) do_boot_behaviour ;;
+        B2\ *) do_poweroff ;;
+        P1\ *) do_change_pass ;;
+        P2\ *) do_performance_menu ;;
+        *) whiptail --msgbox "Programmer error: unrecognized option" 14 60 1 ;;
+      esac || whiptail --msgbox "There was an error running option $FUN" 14 60 1
+    else
+      exit 1
+    fi
+  done
+fi
